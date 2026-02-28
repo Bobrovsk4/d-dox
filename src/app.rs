@@ -5,7 +5,6 @@ use loco_rs::{
     boot::{create_app, BootResult, StartMode},
     config::Config,
     controller::AppRoutes,
-    db::{self, truncate_table},
     environment::Environment,
     task::Tasks,
     Result,
@@ -14,7 +13,7 @@ use migration::Migrator;
 use std::path::Path;
 
 #[allow(unused_imports)]
-use crate::{controllers, models::_entities::users};
+use crate::controllers;
 
 pub struct App;
 #[async_trait]
@@ -46,7 +45,7 @@ impl Hooks for App {
     }
 
     fn routes(_ctx: &AppContext) -> AppRoutes {
-        AppRoutes::with_default_routes() // controller routes below
+        AppRoutes::with_default_routes()
             .add_route(controllers::auth::routes())
     }
     async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()> {
@@ -58,12 +57,9 @@ impl Hooks for App {
         // tasks-inject (do not remove)
     }
     async fn truncate(ctx: &AppContext) -> Result<()> {
-        truncate_table(&ctx.db, users::Entity).await?;
         Ok(())
     }
     async fn seed(ctx: &AppContext, base: &Path) -> Result<()> {
-        db::seed::<users::ActiveModel>(&ctx.db, &base.join("users.yaml").display().to_string())
-            .await?;
         Ok(())
     }
 }
