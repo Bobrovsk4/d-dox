@@ -3741,6 +3741,7 @@ dependencies = [
  "jsonwebtoken",
  "loco-rs",
  "migration",
+ "mime_guess",
  "object_store",
  "sea-orm",
  "serde",

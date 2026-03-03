@@ -1,14 +1,18 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::Response,
     routing::{get, post},
     Json,
 };
 use futures_util::StreamExt;
 use loco_rs::{controller::Routes, prelude::*};
-use object_store::{aws::AmazonS3, aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore};
+use object_store::{
+    aws::{AmazonS3, AmazonS3Builder},
+    path::Path as ObjectPath,
+    Error as ObjectStoreError, ObjectStore,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -16,11 +20,12 @@ use std::sync::OnceLock;
 pub struct FileInfo {
     pub name: String,
     pub size: usize,
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UploadResponse {
-    pub name: String,
+    pub uploaded: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -35,11 +40,11 @@ struct S3Config {
 impl Default for S3Config {
     fn default() -> Self {
         Self {
-            endpoint: "http://minio:9000".to_string(),
-            bucket: "files".to_string(),
-            region: "us-east-1".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".into()),
+            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "files".into()),
+            region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "admin".into()),
+            secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "admin1234".into()),
         }
     }
 }
@@ -58,110 +63,107 @@ fn get_s3_config(ctx: &AppContext) -> S3Config {
         .clone()
 }
 
-fn create_s3_store(config: &S3Config) -> Result<AmazonS3> {
-    let store = AmazonS3Builder::new()
-        .with_bucket_name(&config.bucket)
-        .with_region(&config.region)
-        .with_endpoint(&config.endpoint)
-        .with_access_key_id(&config.access_key)
-        .with_secret_access_key(&config.secret_key)
-        .with_allow_http(true)
-        .with_virtual_hosted_style_request(false)
-        .build()
-        .map_err(|e| Error::Message(e.to_string()))?;
-
-    Ok(store)
-}
 
 pub async fn upload_file(
     State(ctx): State<AppContext>,
     mut multipart: Multipart,
-) -> Result<Response> {
+) -> Result<Json<UploadResponse>> {
     let config = get_s3_config(&ctx);
     let store = create_s3_store(&config)?;
-
-    let mut uploaded_files: Vec<String> = Vec::new();
+    let mut uploaded = Vec::new();
 
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| Error::Message(e.to_string()))?
+        .map_err(|e| Error::Message(format!("Multipart error: {e}")))?
     {
         let file_name = field
             .file_name()
             .map(|s| s.to_string())
-            .ok_or_else(|| Error::Message("No file name provided".to_string()))?;
+            .ok_or_else(|| Error::Message("No filename in multipart field".into()))?;
 
         let bytes = field
             .bytes()
             .await
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|e| Error::Message(format!("Read error: {e}")))?;
 
-        let object_path = ObjectPath::from(file_name.clone());
+        let path = ObjectPath::from(file_name.clone());
         store
-            .put(&object_path, bytes.into())
+            .put(&path, bytes.into())
             .await
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|e| Error::Message(format!("Upload failed: {e}")))?;
 
-        uploaded_files.push(file_name);
+        uploaded.push(file_name);
     }
 
-    Ok(Json(serde_json::json!({
-        "uploaded": uploaded_files
-    }))
-    .into_response())
+    Ok(Json(UploadResponse { uploaded }))
+}
+
+pub async fn get_all_files(State(ctx): State<AppContext>) -> Result<Json<Vec<FileInfo>>> {
+    let config = get_s3_config(&ctx);
+    let store = create_s3_store(&config)?;
+
+    let mut files = Vec::new();
+    let mut stream = store.list(None);
+
+    while let Some(result) = stream.next().await {
+        let meta = result.map_err(|e| Error::Message(format!("List error: {e}")))?;
+        if let Some(name) = meta.location.filename() {
+            files.push(FileInfo {
+                name: name.to_string(),
+                size: meta.size,
+                last_modified: Some(meta.last_modified.to_rfc3339()),
+            });
+        }
+    }
+
+    Ok(Json(files))
 }
 
 pub async fn get_file(
     State(ctx): State<AppContext>,
-    Path(params): Path<std::collections::HashMap<String, String>>,
+    Path(file_name): Path<String>,
 ) -> Result<Response> {
     let config = get_s3_config(&ctx);
     let store = create_s3_store(&config)?;
 
-    let file_name = params.get("file_name").ok_or_else(|| Error::Message("File name required".to_string()))?;
-    let object_path = ObjectPath::from(file_name.clone());
+    let path = ObjectPath::from(file_name.clone());
+    
     let result = store
-        .get(&object_path)
+        .get(&path)
         .await
-        .map_err(|e| Error::Message(e.to_string()))?;
+        .map_err(|e| match e {
+            ObjectStoreError::NotFound { .. } => Error::NotFound,
+            _ => Error::Message(format!("Download error: {e}")),
+        })?;
+
+    let content_type = mime_guess::from_path(&file_name)
+        .first_or_octet_stream()
+        .to_string();
 
     let bytes = result
         .bytes()
         .await
-        .map_err(|e| Error::Message(e.to_string()))?;
+        .map_err(|e| Error::Message(format!("Read error: {e}")))?;
 
     let response = Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(bytes.to_vec()))
-        .map_err(|e| Error::Message(e.to_string()))?;
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", file_name),
+        )
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .map_err(|e| Error::Message(format!("Build response: {e}")))?;
 
     Ok(response)
-}
-
-pub async fn get_all_files(State(ctx): State<AppContext>) -> Result<Response> {
-    let config = get_s3_config(&ctx);
-    let store = create_s3_store(&config)?;
-
-    let mut files: Vec<FileInfo> = Vec::new();
-
-    let mut stream = store.list(None);
-
-    while let Some(result) = stream.next().await {
-        let meta = result.map_err(|e| Error::Message(e.to_string()))?;
-        files.push(FileInfo {
-            name: meta.location.filename().unwrap_or("unknown").to_string(),
-            size: meta.size,
-        });
-    }
-
-    Ok(Json(files).into_response())
 }
 
 pub fn routes() -> Routes {
     Routes::new()
         .prefix("/files")
+        .add("", post(upload_file))
         .add("", get(get_all_files))
         .add("/{file_name}", get(get_file))
-        .add("", post(upload_file))
 }
