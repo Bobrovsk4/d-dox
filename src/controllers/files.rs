@@ -64,6 +64,21 @@ fn get_s3_config(ctx: &AppContext) -> S3Config {
 }
 
 
+fn create_s3_store(config: &S3Config) -> Result<AmazonS3> {
+    let store = AmazonS3Builder::new()
+        .with_bucket_name(&config.bucket)
+        .with_region(&config.region)
+        .with_endpoint(&config.endpoint)
+        .with_access_key_id(&config.access_key)
+        .with_secret_access_key(&config.secret_key)
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(false)
+        .build()
+        .map_err(|e| Error::Message(e.to_string()))?;
+
+    Ok(store)
+}
+
 pub async fn upload_file(
     State(ctx): State<AppContext>,
     mut multipart: Multipart,
