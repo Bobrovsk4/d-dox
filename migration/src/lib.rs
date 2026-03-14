@@ -5,6 +5,7 @@ pub use sea_orm_migration::prelude::*;
 mod m20250101_000001_create_roles;
 mod m20250101_000002_create_users;
 mod m20250101_000003_create_files;
+mod m20250101_000004_seed_default_data;
 
 pub struct Migrator;
 
@@ -15,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20250101_000001_create_roles::Migration),
             Box::new(m20250101_000002_create_users::Migration),
             Box::new(m20250101_000003_create_files::Migration),
+            Box::new(m20250101_000004_seed_default_data::Migration),
             // inject-above (do not remove this comment)
         ]
     }

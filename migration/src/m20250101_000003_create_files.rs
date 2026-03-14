@@ -19,7 +19,7 @@ impl MigrationTrait for Migration {
                             .primary_key(),
                     )
                     .col(ColumnDef::new(Files::Name).string().not_null().unique_key())
-                    .col(ColumnDef::new(Files::Size).integer().not_null())
+                    .col(ColumnDef::new(Files::Size).big_integer().not_null())
                     .col(ColumnDef::new(Files::AuthorId).integer().not_null())
                     .col(
                         ColumnDef::new(Files::CreatedAt)
