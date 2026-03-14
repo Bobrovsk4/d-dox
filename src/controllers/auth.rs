@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{role, user};
 
-const JWT_SECRET: &str = "JWT_SECRET_ZAGLUSHKA";
+const JWT_SECRET: &str = "v7SWenu8m9aPQuDkL6pw";
 const TOKEN_LIFETIME_HOURS: i64 = 168; // 7 дней
 
 #[derive(Debug, Serialize, Deserialize)]

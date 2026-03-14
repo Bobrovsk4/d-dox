@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::{get, post},
     Json,
@@ -90,14 +90,23 @@ fn create_s3_store(config: &S3Config) -> Result<AmazonS3> {
 
 pub async fn upload_file(
     State(ctx): State<AppContext>,
-    auth: auth::JWT,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>> {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Message("Missing Authorization header".into()))?;
+    
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
+    
+    let claims = crate::controllers::auth::decode_token(token)?;
+    
     let config = get_s3_config(&ctx);
     let store = create_s3_store(&config)?;
     let mut uploaded = Vec::new();
 
-    let user_id: i32 = auth.claims.pid.parse().unwrap_or(0);
+    let user_id: i32 = claims.pid.parse().unwrap_or(0);
     let author = user::find_by_id(&ctx.db, user_id)
         .await?
         .ok_or_else(|| Error::Message("User not found".into()))?;

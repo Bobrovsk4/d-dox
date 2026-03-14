@@ -7,8 +7,6 @@ edition = "2024"
 publish = false
 default-run = "server-cli"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [workspace.dependencies]
 loco-rs = { version = "0.16" }
 
