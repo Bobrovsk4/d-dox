@@ -1,6 +1,6 @@
 use axum::routing::{get, post};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use loco_rs::controller::Routes;
 use loco_rs::prelude::*;
 use serde::{Deserialize, Serialize};

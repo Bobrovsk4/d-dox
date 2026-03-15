@@ -1,5 +1,5 @@
 use loco_rs::prelude::*;
-use sea_orm::{entity::prelude::*, ActiveValue::NotSet};
+use sea_orm::{ActiveValue::NotSet, entity::prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::models::role;

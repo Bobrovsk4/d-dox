@@ -18,9 +18,15 @@ impl MigrationTrait for Migration {
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(Files::Name).string().not_null().unique_key())
+                    .col(ColumnDef::new(Files::Name).string().not_null())
                     .col(ColumnDef::new(Files::Size).big_integer().not_null())
                     .col(ColumnDef::new(Files::AuthorId).integer().not_null())
+                    .index(
+                        Index::create()
+                            .unique()
+                            .col(Files::Name)
+                            .col(Files::AuthorId),
+                    )
                     .col(
                         ColumnDef::new(Files::CreatedAt)
                             .timestamp()

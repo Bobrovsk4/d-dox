@@ -1,16 +1,16 @@
 use axum::{
+    Json,
     body::Body,
     extract::{Multipart, Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
     routing::{get, post},
-    Json,
 };
 use loco_rs::{controller::Routes, prelude::*};
 use object_store::{
+    Error as ObjectStoreError, ObjectStore,
     aws::{AmazonS3, AmazonS3Builder},
     path::Path as ObjectPath,
-    Error as ObjectStoreError, ObjectStore,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -24,6 +24,7 @@ pub struct FileInfo {
     pub size: i64,
     pub author: AuthorInfo,
     pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,7 +73,6 @@ fn get_s3_config(ctx: &AppContext) -> S3Config {
         .clone()
 }
 
-
 fn create_s3_store(config: &S3Config) -> Result<AmazonS3> {
     let store = AmazonS3Builder::new()
         .with_bucket_name(&config.bucket)
@@ -97,11 +97,11 @@ pub async fn upload_file(
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| Error::Message("Missing Authorization header".into()))?;
-    
+
     let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
-    
+
     let claims = crate::controllers::auth::decode_token(token)?;
-    
+
     let config = get_s3_config(&ctx);
     let store = create_s3_store(&config)?;
     let mut uploaded = Vec::new();
@@ -144,6 +144,7 @@ pub async fn upload_file(
                 login: author.login.clone(),
             },
             created_at: created_file.created_at.and_utc().to_rfc3339(),
+            updated_at: created_file.updated_at.and_utc().to_rfc3339(),
         });
     }
 
@@ -165,6 +166,7 @@ pub async fn get_all_files(State(ctx): State<AppContext>) -> Result<Json<Vec<Fil
                     login: a.login,
                 },
                 created_at: f.created_at.and_utc().to_rfc3339(),
+                updated_at: f.updated_at.and_utc().to_rfc3339(),
             })
         })
         .collect();
@@ -180,14 +182,11 @@ pub async fn get_file(
     let store = create_s3_store(&config)?;
 
     let path = ObjectPath::from(file_name.clone());
-    
-    let result = store
-        .get(&path)
-        .await
-        .map_err(|e| match e {
-            ObjectStoreError::NotFound { .. } => Error::NotFound,
-            _ => Error::Message(format!("Download error: {e}")),
-        })?;
+
+    let result = store.get(&path).await.map_err(|e| match e {
+        ObjectStoreError::NotFound { .. } => Error::NotFound,
+        _ => Error::Message(format!("Download error: {e}")),
+    })?;
 
     let content_type = mime_guess::from_path(&file_name)
         .first_or_octet_stream()
@@ -212,10 +211,75 @@ pub async fn get_file(
     Ok(response)
 }
 
+pub async fn sync_files(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>> {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Message("Missing Authorization header".into()))?;
+
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
+
+    let claims = crate::controllers::auth::decode_token(token)?;
+
+    let config = get_s3_config(&ctx);
+    let store = create_s3_store(&config)?;
+    let mut uploaded = Vec::new();
+
+    let user_id: i32 = claims.pid.parse().unwrap_or(0);
+    let author = user::find_by_id(&ctx.db, user_id)
+        .await?
+        .ok_or_else(|| Error::Message("User not found".into()))?;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| Error::Message(format!("Multipart error: {e}")))?
+    {
+        let file_name = field
+            .file_name()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::Message("No filename in multipart field".into()))?;
+
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| Error::Message(format!("Read error: {e}")))?;
+
+        let size = bytes.len() as i64;
+
+        let path = ObjectPath::from(file_name.clone());
+        store
+            .put(&path, bytes.clone().into())
+            .await
+            .map_err(|e| Error::Message(format!("Upload failed: {e}")))?;
+
+        let synced_file =
+            file::sync_by_name_and_author(&ctx.db, &file_name, size, author.id).await?;
+        uploaded.push(FileInfo {
+            id: synced_file.id,
+            name: synced_file.name,
+            size: synced_file.size,
+            author: AuthorInfo {
+                id: author.id,
+                login: author.login.clone(),
+            },
+            created_at: synced_file.created_at.and_utc().to_rfc3339(),
+            updated_at: synced_file.updated_at.and_utc().to_rfc3339(),
+        });
+    }
+
+    Ok(Json(UploadResponse { uploaded }))
+}
+
 pub fn routes() -> Routes {
     Routes::new()
         .prefix("/files")
         .add("", post(upload_file))
         .add("", get(get_all_files))
         .add("/{file_name}", get(get_file))
+        .add("/sync", post(sync_files))
 }

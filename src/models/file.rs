@@ -1,6 +1,6 @@
 use chrono::Utc;
 use loco_rs::prelude::*;
-use sea_orm::{entity::prelude::*, ActiveValue::NotSet};
+use sea_orm::{ActiveValue::NotSet, entity::prelude::*};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Deserialize, Serialize)]
@@ -13,6 +13,8 @@ pub struct Model {
     pub author_id: i32,
     #[sea_orm(column_type = "Timestamp")]
     pub created_at: sea_orm::prelude::DateTime,
+    #[sea_orm(column_type = "Timestamp")]
+    pub updated_at: sea_orm::prelude::DateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -39,12 +41,14 @@ pub async fn create(
     size: i64,
     author_id: i32,
 ) -> Result<Model, DbErr> {
+    let now = Utc::now().naive_utc();
     let res = Entity::insert(ActiveModel {
         id: NotSet,
         name: Set(name.to_string()),
         size: Set(size),
         author_id: Set(author_id),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(now),
+        updated_at: Set(now),
     })
     .exec(db)
     .await?;
@@ -77,4 +81,45 @@ pub async fn find_with_author(
         .filter(Column::Id.eq(id))
         .one(db)
         .await
+}
+
+pub async fn sync_by_name_and_author(
+    db: &DatabaseConnection,
+    name: &str,
+    size: i64,
+    author_id: i32,
+) -> Result<Model, DbErr> {
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter};
+
+    let now = Utc::now().naive_utc();
+
+    if let Some(existing) = Entity::find()
+        .filter(Column::Name.eq(name))
+        .filter(Column::AuthorId.eq(author_id))
+        .one(db)
+        .await?
+    {
+        let mut active_model: ActiveModel = existing.into();
+        active_model.size = Set(size);
+        active_model.updated_at = Set(now);
+        return active_model.update(db).await;
+    }
+
+    Entity::insert(ActiveModel {
+        id: NotSet,
+        name: Set(name.to_string()),
+        size: Set(size),
+        author_id: Set(author_id),
+        created_at: Set(now),
+        updated_at: Set(now),
+    })
+    .exec(db)
+    .await?;
+
+    Entity::find()
+        .filter(Column::Name.eq(name))
+        .filter(Column::AuthorId.eq(author_id))
+        .one(db)
+        .await?
+        .ok_or(DbErr::RecordNotFound("File not found".to_string()))
 }
