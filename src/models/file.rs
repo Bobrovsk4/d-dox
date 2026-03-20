@@ -15,6 +15,8 @@ pub struct Model {
     pub created_at: sea_orm::prelude::DateTime,
     #[sea_orm(column_type = "Timestamp")]
     pub updated_at: sea_orm::prelude::DateTime,
+    #[sea_orm(column_type = "Integer", default_value = 1)]
+    pub version: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -49,6 +51,7 @@ pub async fn create(
         author_id: Set(author_id),
         created_at: Set(now),
         updated_at: Set(now),
+        version: Set(1),
     })
     .exec(db)
     .await?;
@@ -83,6 +86,62 @@ pub async fn find_with_author(
         .await
 }
 
+pub async fn update_with_version_check(
+    db: &DatabaseConnection,
+    id: i32,
+    expected_version: i32,
+    size: i64,
+) -> Result<Model, DbErr> {
+    use sea_orm::{ActiveModelTrait, EntityTrait};
+
+    let existing = Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .ok_or(DbErr::RecordNotFound(format!("File {} not found", id)))?;
+
+    if existing.version != expected_version {
+        return Err(DbErr::Custom(format!(
+            "Version conflict: expected {}, current {}",
+            expected_version, existing.version
+        )));
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut active_model: ActiveModel = existing.clone().into();
+    active_model.size = Set(size);
+    active_model.updated_at = Set(now);
+    active_model.version = Set(existing.version + 1);
+    active_model.update(db).await
+}
+
+pub async fn sync_with_version_check(
+    db: &DatabaseConnection,
+    file_id: i32,
+    expected_version: i32,
+    size: i64,
+) -> Result<Model, DbErr> {
+    use sea_orm::{ActiveModelTrait, EntityTrait};
+
+    let existing = Entity::find_by_id(file_id)
+        .one(db)
+        .await?
+        .ok_or(DbErr::RecordNotFound(format!("File {} not found", file_id)))?;
+
+    if existing.version != expected_version {
+        return Err(DbErr::Custom(format!(
+            "Version conflict: expected {}, current {}",
+            expected_version, existing.version
+        )));
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut active_model: ActiveModel = existing.clone().into();
+    active_model.size = Set(size);
+    active_model.updated_at = Set(now);
+    active_model.version = Set(existing.version + 1);
+    active_model.update(db).await
+}
+
 pub async fn sync_by_name_and_author(
     db: &DatabaseConnection,
     name: &str,
@@ -99,9 +158,10 @@ pub async fn sync_by_name_and_author(
         .one(db)
         .await?
     {
-        let mut active_model: ActiveModel = existing.into();
+        let mut active_model: ActiveModel = existing.clone().into();
         active_model.size = Set(size);
         active_model.updated_at = Set(now);
+        active_model.version = Set(existing.version + 1);
         return active_model.update(db).await;
     }
 
@@ -112,6 +172,7 @@ pub async fn sync_by_name_and_author(
         author_id: Set(author_id),
         created_at: Set(now),
         updated_at: Set(now),
+        version: Set(1),
     })
     .exec(db)
     .await?;

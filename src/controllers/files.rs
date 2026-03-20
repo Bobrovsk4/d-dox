@@ -17,6 +17,12 @@ use std::sync::OnceLock;
 
 use crate::models::{file, user};
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateWithVersionRequest {
+    pub version: i32,
+    pub size: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileInfo {
     pub id: i32,
@@ -25,6 +31,7 @@ pub struct FileInfo {
     pub author: AuthorInfo,
     pub created_at: String,
     pub updated_at: String,
+    pub version: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,6 +152,7 @@ pub async fn upload_file(
             },
             created_at: created_file.created_at.and_utc().to_rfc3339(),
             updated_at: created_file.updated_at.and_utc().to_rfc3339(),
+            version: created_file.version,
         });
     }
 
@@ -154,7 +162,7 @@ pub async fn upload_file(
 pub async fn get_all_files(State(ctx): State<AppContext>) -> Result<Json<Vec<FileInfo>>> {
     let db_files = file::find_all_with_authors(&ctx.db).await?;
 
-    let files = db_files
+    let files: Vec<FileInfo> = db_files
         .into_iter()
         .filter_map(|(f, author)| {
             author.map(|a| FileInfo {
@@ -167,6 +175,7 @@ pub async fn get_all_files(State(ctx): State<AppContext>) -> Result<Json<Vec<Fil
                 },
                 created_at: f.created_at.and_utc().to_rfc3339(),
                 updated_at: f.updated_at.and_utc().to_rfc3339(),
+                version: f.version,
             })
         })
         .collect();
@@ -215,7 +224,7 @@ pub async fn sync_files(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<Json<UploadResponse>> {
+) -> Result<Json<FileInfo>> {
     let auth_header = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -225,54 +234,132 @@ pub async fn sync_files(
 
     let claims = crate::controllers::auth::decode_token(token)?;
 
-    let config = get_s3_config(&ctx);
-    let store = create_s3_store(&config)?;
-    let mut uploaded = Vec::new();
-
     let user_id: i32 = claims.pid.parse().unwrap_or(0);
     let author = user::find_by_id(&ctx.db, user_id)
         .await?
         .ok_or_else(|| Error::Message("User not found".into()))?;
+
+    let mut file_id: Option<i32> = None;
+    let mut version: Option<i32> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| Error::Message(format!("Multipart error: {e}")))?
     {
-        let file_name = field
-            .file_name()
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::Message("No filename in multipart field".into()))?;
-
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|e| Error::Message(format!("Read error: {e}")))?;
-
-        let size = bytes.len() as i64;
-
-        let path = ObjectPath::from(file_name.clone());
-        store
-            .put(&path, bytes.clone().into())
-            .await
-            .map_err(|e| Error::Message(format!("Upload failed: {e}")))?;
-
-        let synced_file =
-            file::sync_by_name_and_author(&ctx.db, &file_name, size, author.id).await?;
-        uploaded.push(FileInfo {
-            id: synced_file.id,
-            name: synced_file.name,
-            size: synced_file.size,
-            author: AuthorInfo {
-                id: author.id,
-                login: author.login.clone(),
-            },
-            created_at: synced_file.created_at.and_utc().to_rfc3339(),
-            updated_at: synced_file.updated_at.and_utc().to_rfc3339(),
-        });
+        if let Some(name) = field.name() {
+            match name {
+                "file_id" => {
+                    let text = field
+                        .text()
+                        .await
+                        .map_err(|e| Error::Message(format!("Read file_id: {e}")))?;
+                    file_id = text.parse().ok();
+                }
+                "version" => {
+                    let text = field
+                        .text()
+                        .await
+                        .map_err(|e| Error::Message(format!("Read version: {e}")))?;
+                    version = text.parse().ok();
+                }
+                "file" => {
+                    file_name = field.file_name().map(|s| s.to_string());
+                    let bytes = field
+                        .bytes()
+                        .await
+                        .map_err(|e| Error::Message(format!("Read file: {e}")))?;
+                    file_bytes = Some(bytes.to_vec());
+                }
+                _ => {}
+            }
+        }
     }
 
-    Ok(Json(UploadResponse { uploaded }))
+    let file_id = file_id.ok_or_else(|| Error::Message("Missing file_id".into()))?;
+    let version = version.ok_or_else(|| Error::Message("Missing version".into()))?;
+    let bytes = file_bytes.ok_or_else(|| Error::Message("Missing file".into()))?;
+    let file_name = file_name.ok_or_else(|| Error::Message("Missing filename".into()))?;
+
+    let config = get_s3_config(&ctx);
+    let store = create_s3_store(&config)?;
+
+    let size = bytes.len() as i64;
+
+    let synced_file = file::sync_with_version_check(&ctx.db, file_id, version, size)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("Version conflict") {
+                Error::BadRequest(e.to_string())
+            } else {
+                Error::Message(e.to_string())
+            }
+        })?;
+
+    let path = ObjectPath::from(file_name.clone());
+    store
+        .put(&path, bytes.into())
+        .await
+        .map_err(|e| Error::Message(format!("Upload failed: {e}")))?;
+
+    Ok(Json(FileInfo {
+        id: synced_file.id,
+        name: synced_file.name.clone(),
+        size: synced_file.size,
+        author: AuthorInfo {
+            id: author.id,
+            login: author.login.clone(),
+        },
+        created_at: synced_file.created_at.and_utc().to_rfc3339(),
+        updated_at: synced_file.updated_at.and_utc().to_rfc3339(),
+        version: synced_file.version,
+    }))
+}
+
+pub async fn update_file_with_version(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(file_id): Path<i32>,
+    Json(body): Json<UpdateWithVersionRequest>,
+) -> Result<Json<FileInfo>> {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Message("Missing Authorization header".into()))?;
+
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
+
+    let claims = crate::controllers::auth::decode_token(token)?;
+
+    let user_id: i32 = claims.pid.parse().unwrap_or(0);
+    let author = user::find_by_id(&ctx.db, user_id)
+        .await?
+        .ok_or_else(|| Error::Message("User not found".into()))?;
+
+    let updated_file = file::update_with_version_check(&ctx.db, file_id, body.version, body.size)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("Version conflict") {
+                Error::BadRequest(e.to_string())
+            } else {
+                Error::Message(e.to_string())
+            }
+        })?;
+
+    Ok(Json(FileInfo {
+        id: updated_file.id,
+        name: updated_file.name.clone(),
+        size: updated_file.size,
+        author: AuthorInfo {
+            id: author.id,
+            login: author.login.clone(),
+        },
+        created_at: updated_file.created_at.and_utc().to_rfc3339(),
+        updated_at: updated_file.updated_at.and_utc().to_rfc3339(),
+        version: updated_file.version,
+    }))
 }
 
 pub fn routes() -> Routes {
